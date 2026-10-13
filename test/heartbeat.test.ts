@@ -6,8 +6,9 @@
  * pattern breaks every customer using the GitHub Action, so this test
  * is the load-bearing safety net for that integration.
  */
-import { describe, it, expect, beforeEach } from "vitest";
-import { runHeartbeat } from "../src/commands/heartbeat.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { Command } from "commander";
+import { registerHeartbeatCommand, runHeartbeat } from "../src/commands/heartbeat.js";
 
 interface RecordedCall {
   url: string;
@@ -56,8 +57,50 @@ describe("uw heartbeat", () => {
 
   it("attaches state + message to the payload when provided", async () => {
     const { calls, fetchImpl } = makeFetch();
-    await runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure", message: "deploy 17 broke" });
-    expect(calls[0].body).toEqual({ state: "failure", message: "deploy 17 broke" });
+    await runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "success", message: "deploy 17 ok" });
+    expect(calls[0].body).toEqual({ state: "success", message: "deploy 17 ok" });
+  });
+
+  // The endpoint records every ping as a success. Sending one for a failed
+  // job would mark it healthy, so --state failure must fail without a request.
+  it("refuses --state failure without sending anything", async () => {
+    const { calls, fetchImpl } = makeFetch();
+    await expect(
+      runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure" }),
+    ).rejects.toMatchObject({ name: "UnsupportedHeartbeatStateError", message: expect.stringMatching(/not supported yet/) });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects unknown states without sending anything", async () => {
+    const { calls, fetchImpl } = makeFetch();
+    await expect(
+      runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "degraded" as "success" }),
+    ).rejects.toThrow(/must be "success" or "failure"/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("uw heartbeat --state failure exits 1 and sends nothing (commander)", async () => {
+    const { calls, fetchImpl } = makeFetch();
+    vi.stubGlobal("fetch", fetchImpl);
+    let err = "";
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      err += chunk.toString();
+      return true;
+    });
+    try {
+      process.exitCode = undefined;
+      const program = new Command();
+      program.exitOverride();
+      registerHeartbeatCommand(program);
+      await program.parseAsync(["node", "uw", "heartbeat", "tok", "--state", "failure", "--base-url", "https://api.example.com"]);
+      expect(process.exitCode).toBe(1);
+      expect(err).toMatch(/not supported yet/);
+      expect(calls).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      vi.unstubAllGlobals();
+      process.exitCode = undefined;
+    }
   });
 
   it("rejects empty token", async () => {

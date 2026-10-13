@@ -74,13 +74,13 @@ describe("asLiveMonitors envelope unwrap", () => {
 });
 
 describe("CLI apply — token-auth v1 surface", () => {
-  it("lists via GET /api/v1/monitors?managedBySource=cli", async () => {
+  it("lists via GET /api/v1/monitors?managedBySource=cli with the maximum page size", async () => {
     const cfgFile = join(tmp, "m.json");
     writeFileSync(cfgFile, JSON.stringify({ monitors: [] }));
     const { calls, fetchImpl } = makeFetch({ success: true, data: [] });
     await runApply({ file: cfgFile, fetchImpl, baseUrl: "https://uw.example.com" });
     expect(calls[0].method).toBe("GET");
-    expect(calls[0].url).toBe("https://uw.example.com/api/v1/monitors?managedBySource=cli");
+    expect(calls[0].url).toBe("https://uw.example.com/api/v1/monitors?managedBySource=cli&limit=100&page=1");
   });
 
   it("POSTs create with externalId + managedBySource=cli", async () => {

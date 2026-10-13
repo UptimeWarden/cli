@@ -5,6 +5,9 @@
  * own scripts (or test the action's payload locally before wiring it up
  * to GHA). The endpoint is anonymous, so this command does NOT require
  * `uw auth login` to have run.
+ *
+ * `--state failure` is refused: the heartbeat endpoint records every ping as
+ * a success, so sending one for a failed job would report it healthy.
  */
 import pc from "picocolors";
 import { Command } from "commander";
@@ -18,9 +21,29 @@ export interface HeartbeatOptions {
   fetchImpl?: typeof fetch;
 }
 
+/** Thrown for a state the server cannot record yet. Nothing is sent. */
+export class UnsupportedHeartbeatStateError extends Error {
+  constructor(state: string) {
+    super(
+      `--state ${state} is not supported yet: the heartbeat endpoint records every ping as a success, ` +
+        `so nothing was sent. To report a failed job, skip the ping; the monitor alerts when the ` +
+        `heartbeat is overdue.`,
+    );
+    this.name = "UnsupportedHeartbeatStateError";
+  }
+}
+
+const KNOWN_STATES = new Set(["success", "failure"]);
+
 export async function runHeartbeat(token: string, opts: HeartbeatOptions = {}): Promise<{ status: number; url: string }> {
   if (!token || token.trim().length === 0) {
     throw new Error("Heartbeat token is required. Usage: uw heartbeat <token>");
+  }
+  if (opts.state !== undefined && !KNOWN_STATES.has(opts.state)) {
+    throw new Error(`--state must be "success" or "failure" (got "${opts.state}")`);
+  }
+  if (opts.state === "failure") {
+    throw new UnsupportedHeartbeatStateError(opts.state);
   }
   const client = createClient({ baseUrl: opts.baseUrl, fetchImpl: opts.fetchImpl });
   const payload: Record<string, unknown> = {};
@@ -33,7 +56,7 @@ export function registerHeartbeatCommand(program: Command): void {
   program
     .command("heartbeat <token>")
     .description("Send a heartbeat ping (no auth required — token IS the auth)")
-    .option("--state <state>", "Reported state: success | failure", "success")
+    .option("--state <state>", "Reported state: success (failure is not supported yet and exits 1)", "success")
     .option("--message <text>", "Optional human-readable message attached to the ping")
     .option("--base-url <url>", "Override API base URL")
     .action(async (token: string, opts: HeartbeatOptions) => {
