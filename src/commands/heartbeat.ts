@@ -1,13 +1,11 @@
 /**
- * `uw heartbeat <token>` — POST /api/heartbeat/:token/ping
+ * `uw heartbeat <token>` — POST /api/heartbeat/:token/ping, or
+ * `uw heartbeat <token> --state failure` — POST /api/heartbeat/:token/fail
  *
  * Mirrors the GitHub Action so users can drop the same call into their
  * own scripts (or test the action's payload locally before wiring it up
  * to GHA). The endpoint is anonymous, so this command does NOT require
  * `uw auth login` to have run.
- *
- * `--state failure` is refused: the heartbeat endpoint records every ping as
- * a success, so sending one for a failed job would report it healthy.
  */
 import pc from "picocolors";
 import { Command } from "commander";
@@ -21,43 +19,40 @@ export interface HeartbeatOptions {
   fetchImpl?: typeof fetch;
 }
 
-/** Thrown for a state the server cannot record yet. Nothing is sent. */
-export class UnsupportedHeartbeatStateError extends Error {
-  constructor(state: string) {
-    super(
-      `--state ${state} is not supported yet: the heartbeat endpoint records every ping as a success, ` +
-        `so nothing was sent. To report a failed job, skip the ping; the monitor alerts when the ` +
-        `heartbeat is overdue.`,
-    );
-    this.name = "UnsupportedHeartbeatStateError";
-  }
-}
-
 const KNOWN_STATES = new Set(["success", "failure"]);
 
+/** The API stores at most this many characters of a failure message. */
+export const MAX_MESSAGE_LENGTH = 500;
+
+/**
+ * success → POST /api/heartbeat/:token/ping
+ * failure → POST /api/heartbeat/:token/fail (the message becomes the
+ *           incident's error; the incident opens at the scheduler's next
+ *           tick, within about 30 seconds).
+ */
 export async function runHeartbeat(token: string, opts: HeartbeatOptions = {}): Promise<{ status: number; url: string }> {
   if (!token || token.trim().length === 0) {
     throw new Error("Heartbeat token is required. Usage: uw heartbeat <token>");
   }
-  if (opts.state !== undefined && !KNOWN_STATES.has(opts.state)) {
-    throw new Error(`--state must be "success" or "failure" (got "${opts.state}")`);
+  const state = opts.state ?? "success";
+  if (!KNOWN_STATES.has(state)) {
+    throw new Error(`--state must be "success" or "failure" (got "${state}")`);
   }
-  if (opts.state === "failure") {
-    throw new UnsupportedHeartbeatStateError(opts.state);
+  if (opts.message !== undefined && opts.message.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(`--message is ${opts.message.length} characters; the API keeps at most ${MAX_MESSAGE_LENGTH}`);
   }
   const client = createClient({ baseUrl: opts.baseUrl, fetchImpl: opts.fetchImpl });
   const payload: Record<string, unknown> = {};
-  if (opts.state) payload.state = opts.state;
   if (opts.message) payload.message = opts.message;
-  return client.heartbeatPing(token, payload);
+  return client.heartbeatPing(token, payload, state === "failure" ? "fail" : "ping");
 }
 
 export function registerHeartbeatCommand(program: Command): void {
   program
     .command("heartbeat <token>")
-    .description("Send a heartbeat ping (no auth required — token IS the auth)")
-    .option("--state <state>", "Reported state: success (failure is not supported yet and exits 1)", "success")
-    .option("--message <text>", "Optional human-readable message attached to the ping")
+    .description("Send a heartbeat ping, or report a failure (no auth required — token IS the auth)")
+    .option("--state <state>", "success (ping) or failure (opens an incident now)", "success")
+    .option("--message <text>", `Optional message (at most ${MAX_MESSAGE_LENGTH} characters); on failure it becomes the incident's error`)
     .option("--base-url <url>", "Override API base URL")
     .action(async (token: string, opts: HeartbeatOptions) => {
       try {

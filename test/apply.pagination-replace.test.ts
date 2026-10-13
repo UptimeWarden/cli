@@ -38,6 +38,14 @@ function paginatedFetch(
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(init.body as string) : undefined;
     calls.push({ url: url.toString(), method, body });
+    const detail = url.pathname.match(/^\/api\/v1\/monitors\/([^/]+)$/);
+    if (method === "GET" && detail) {
+      const m = live.find((x) => x.publicId === decodeURIComponent(detail[1]));
+      return new Response(JSON.stringify(m ? { success: true, data: m } : { success: false }), {
+        status: m ? 200 : 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (method === "GET") {
       const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
       const limit = Math.min(100, Number(url.searchParams.get("limit")) || 20);
@@ -136,21 +144,33 @@ describe("apply reads every page of managed monitors", () => {
   });
 });
 
-describe("type change = replace", () => {
+describe("type changes", () => {
   const live: LiveMonitor[] = [
     { publicId: "pub_db", externalId: "db", name: "DB", type: "http", url: "tcp://db:5432" },
   ];
-  const declared = [{ externalId: "db", name: "DB", type: "tcp", url: "tcp://db:5432", timeout: 10 }];
 
-  it("computeDiff puts a type change in toReplace, not toUpdate", () => {
-    const diff = computeDiff({ monitors: declared }, live);
+  it("http → tcp is an in-place update (PATCH with type)", async () => {
+    const file = writeCfg([{ externalId: "db", name: "DB", type: "tcp", url: "tcp://db:5432" }]);
+    const { calls, fetchImpl } = paginatedFetch(live);
+    const result = await runApply({ file, yes: true, fetchImpl, baseUrl: "https://uw.example.com", log: () => {} });
+    expect(result.diff.toReplace).toHaveLength(0);
+    expect(result.updated).toBe(1);
+    const writes = calls.filter((c) => c.method !== "GET");
+    expect(writes.map((c) => c.method)).toEqual(["PATCH"]);
+    expect(writes[0].body).toEqual({ type: "tcp" });
+  });
+
+  const toHeartbeat = [{ externalId: "db", name: "DB", type: "heartbeat", heartbeatGraceSeconds: 120 }];
+
+  it("http → heartbeat is a replacement", () => {
+    const diff = computeDiff({ monitors: toHeartbeat }, live);
     expect(diff.toUpdate).toHaveLength(0);
     expect(diff.toReplace).toHaveLength(1);
     expect(diff.toReplace[0].changedFields).toContain("type");
   });
 
   it("without --allow-delete: nothing is written and the change is reported blocked", async () => {
-    const file = writeCfg(declared);
+    const file = writeCfg(toHeartbeat);
     const { calls, fetchImpl } = paginatedFetch(live);
     const lines: string[] = [];
     const result = await runApply({
@@ -163,12 +183,12 @@ describe("type change = replace", () => {
     expect(result.blocked).toBe(1);
     expect(result.replaced).toBe(0);
     expect(calls.filter((c) => c.method !== "GET")).toHaveLength(0);
-    expect(lines.join("\n")).toMatch(/cannot change a monitor's type/);
+    expect(lines.join("\n")).toMatch(/cannot change a monitor to or from heartbeat/);
     expect(lines.join("\n")).toMatch(/--allow-delete/);
   });
 
-  it("with --allow-delete: DELETE the old monitor, then POST the new type", async () => {
-    const file = writeCfg(declared);
+  it("with --allow-delete: DELETE the old monitor, then POST the heartbeat (no url)", async () => {
+    const file = writeCfg(toHeartbeat);
     const { calls, fetchImpl } = paginatedFetch(live);
     const result = await runApply({
       file,
@@ -181,16 +201,15 @@ describe("type change = replace", () => {
     expect(result.replaced).toBe(1);
     expect(result.blocked).toBe(0);
     const writes = calls.filter((c) => c.method !== "GET");
-    expect(writes.map((c) => c.method)).toEqual(["DELETE", "POST", "PATCH"]);
+    expect(writes.map((c) => c.method)).toEqual(["DELETE", "POST"]);
     expect(writes[0].url).toContain("/api/v1/monitors/pub_db");
-    expect(writes[1].body).toMatchObject({ externalId: "db", type: "tcp", managedBySource: "cli" });
-    // The create path applies the default timeout; the declared one follows as a PATCH.
-    expect(writes[2].url).toContain("/api/v1/monitors/new_pub_id");
-    expect(writes[2].body).toEqual({ timeout: 10 });
+    expect(writes[1].body).toEqual({
+      externalId: "db", name: "DB", type: "heartbeat", heartbeatGraceSeconds: 120, managedBySource: "cli",
+    });
   });
 
   it("the plan JSON marks the replacement as blocked without --allow-delete", () => {
-    const diff = computeDiff({ monitors: declared }, live);
+    const diff = computeDiff({ monitors: toHeartbeat }, live);
     const plan = planToJson(diff, false);
     expect(plan.hasDrift).toBe(true);
     expect(plan.replace).toEqual([
@@ -198,8 +217,8 @@ describe("type change = replace", () => {
         externalId: "db",
         publicId: "pub_db",
         fromType: "http",
-        toType: "tcp",
-        changedFields: ["type", "timeout"],
+        toType: "heartbeat",
+        changedFields: ["type", "heartbeatGraceSeconds"],
         blocked: true,
       },
     ]);
@@ -255,7 +274,7 @@ describe("uw apply exit codes and --json (commander)", () => {
 
   it("--yes with a blocked type change exits 1", async () => {
     const live: LiveMonitor[] = [{ publicId: "p", externalId: "x", name: "X", type: "http" }];
-    const file = writeCfg([{ externalId: "x", name: "X", type: "ping" }]);
+    const file = writeCfg([{ externalId: "x", name: "X", type: "heartbeat" }]);
     await run(["-f", file, "--yes", "--base-url", "https://uw.example.com"], live);
     expect(process.exitCode).toBe(1);
     expect(out).toMatch(/blocked/);

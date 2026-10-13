@@ -58,16 +58,24 @@ describe("uw heartbeat", () => {
   it("attaches state + message to the payload when provided", async () => {
     const { calls, fetchImpl } = makeFetch();
     await runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "success", message: "deploy 17 ok" });
-    expect(calls[0].body).toEqual({ state: "success", message: "deploy 17 ok" });
+    expect(calls[0].url).toBe("https://api.example.com/api/heartbeat/tok/ping");
+    expect(calls[0].body).toEqual({ message: "deploy 17 ok" });
   });
 
-  // The endpoint records every ping as a success. Sending one for a failed
-  // job would mark it healthy, so --state failure must fail without a request.
-  it("refuses --state failure without sending anything", async () => {
+  it("--state failure POSTs to /fail with the message", async () => {
+    const { calls, fetchImpl } = makeFetch();
+    await runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure", message: "pg_dump exited 1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://api.example.com/api/heartbeat/tok/fail");
+    expect(calls[0].method).toBe("POST");
+    expect(calls[0].body).toEqual({ message: "pg_dump exited 1" });
+  });
+
+  it("rejects a message over 500 characters without sending anything", async () => {
     const { calls, fetchImpl } = makeFetch();
     await expect(
-      runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure" }),
-    ).rejects.toMatchObject({ name: "UnsupportedHeartbeatStateError", message: expect.stringMatching(/not supported yet/) });
+      runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure", message: "x".repeat(501) }),
+    ).rejects.toThrow(/at most 500/);
     expect(calls).toHaveLength(0);
   });
 
@@ -79,12 +87,12 @@ describe("uw heartbeat", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("uw heartbeat --state failure exits 1 and sends nothing (commander)", async () => {
+  it("uw heartbeat --state failure --message (commander) calls /fail and exits 0", async () => {
     const { calls, fetchImpl } = makeFetch();
     vi.stubGlobal("fetch", fetchImpl);
-    let err = "";
-    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
-      err += chunk.toString();
+    let out = "";
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+      out += chunk.toString();
       return true;
     });
     try {
@@ -92,10 +100,13 @@ describe("uw heartbeat", () => {
       const program = new Command();
       program.exitOverride();
       registerHeartbeatCommand(program);
-      await program.parseAsync(["node", "uw", "heartbeat", "tok", "--state", "failure", "--base-url", "https://api.example.com"]);
-      expect(process.exitCode).toBe(1);
-      expect(err).toMatch(/not supported yet/);
-      expect(calls).toHaveLength(0);
+      await program.parseAsync([
+        "node", "uw", "heartbeat", "tok", "--state", "failure", "--message", "boom", "--base-url", "https://api.example.com",
+      ]);
+      expect(process.exitCode).toBeUndefined();
+      expect(calls.map((c) => c.url)).toEqual(["https://api.example.com/api/heartbeat/tok/fail"]);
+      expect(calls[0].body).toEqual({ message: "boom" });
+      expect(out).toMatch(/\/fail/);
     } finally {
       spy.mockRestore();
       vi.unstubAllGlobals();
