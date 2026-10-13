@@ -71,12 +71,10 @@ describe("uw heartbeat", () => {
     expect(calls[0].body).toEqual({ message: "pg_dump exited 1" });
   });
 
-  it("rejects a message over 500 characters without sending anything", async () => {
+  it("sends a long message as is (the API keeps the first 500 characters)", async () => {
     const { calls, fetchImpl } = makeFetch();
-    await expect(
-      runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure", message: "x".repeat(501) }),
-    ).rejects.toThrow(/at most 500/);
-    expect(calls).toHaveLength(0);
+    await runHeartbeat("tok", { fetchImpl, baseUrl: "https://api.example.com", state: "failure", message: "x".repeat(600) });
+    expect((calls[0].body as { message: string }).message).toHaveLength(600);
   });
 
   it("rejects unknown states without sending anything", async () => {

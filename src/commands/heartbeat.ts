@@ -21,7 +21,7 @@ export interface HeartbeatOptions {
 
 const KNOWN_STATES = new Set(["success", "failure"]);
 
-/** The API stores at most this many characters of a failure message. */
+/** The API keeps the first 500 characters of a failure message. */
 export const MAX_MESSAGE_LENGTH = 500;
 
 /**
@@ -38,9 +38,6 @@ export async function runHeartbeat(token: string, opts: HeartbeatOptions = {}): 
   if (!KNOWN_STATES.has(state)) {
     throw new Error(`--state must be "success" or "failure" (got "${state}")`);
   }
-  if (opts.message !== undefined && opts.message.length > MAX_MESSAGE_LENGTH) {
-    throw new Error(`--message is ${opts.message.length} characters; the API keeps at most ${MAX_MESSAGE_LENGTH}`);
-  }
   const client = createClient({ baseUrl: opts.baseUrl, fetchImpl: opts.fetchImpl });
   const payload: Record<string, unknown> = {};
   if (opts.message) payload.message = opts.message;
@@ -52,7 +49,7 @@ export function registerHeartbeatCommand(program: Command): void {
     .command("heartbeat <token>")
     .description("Send a heartbeat ping, or report a failure (no auth required — token IS the auth)")
     .option("--state <state>", "success (ping) or failure (opens an incident now)", "success")
-    .option("--message <text>", `Optional message (at most ${MAX_MESSAGE_LENGTH} characters); on failure it becomes the incident's error`)
+    .option("--message <text>", `Optional message; on failure it becomes the incident's error (the API keeps the first ${MAX_MESSAGE_LENGTH} characters)`)
     .option("--base-url <url>", "Override API base URL")
     .action(async (token: string, opts: HeartbeatOptions) => {
       try {

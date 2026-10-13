@@ -119,7 +119,7 @@ deleted (with its history) and a new one is created with the same
 | `uw auth status` | Show whether a token is configured (never prints the token) |
 | `uw auth logout` | Remove the saved token |
 | `uw heartbeat <token>` | Send a heartbeat ping (`POST /api/heartbeat/:token/ping`) |
-| `uw heartbeat <token> --state failure [--message <text>]` | Report a failure (`POST /api/heartbeat/:token/fail`); the message (at most 500 characters) becomes the incident's error |
+| `uw heartbeat <token> --state failure [--message <text>]` | Report a failure (`POST /api/heartbeat/:token/fail`); the message becomes the incident's error (the API keeps the first 500 characters) |
 | `uw apply -f <file>` | Show the plan for a config file. Nothing is written without `--yes` |
 | `uw apply -f <file> --yes` | Apply creates and updates |
 | `uw apply -f <file> --yes --allow-delete` | Also delete CLI-managed monitors that are not in the file, and replace monitors whose `type` changes to or from `heartbeat` |
