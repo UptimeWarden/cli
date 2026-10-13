@@ -9,19 +9,24 @@
  *   --yes                 Apply changes. Without this flag the command
  *                         is always dry-run and exits 0.
  *   --allow-delete        Enable deletion of monitors no longer in the
- *                         config, and type changes (delete + create).
- *                         Without this flag both are shown in the plan but
- *                         never applied — prevents footgun.
+ *                         config, and type changes to or from heartbeat
+ *                         (delete + create). Without this flag both are
+ *                         shown in the plan but never applied.
  *   --diff-only           Exit 0 when no drift, exit 2 when drift detected.
  *                         Useful for PR gate: fail if config is out of sync.
  *   --json                Print the plan (or the apply result) as JSON on
  *                         stdout; progress lines go to stderr.
  *   --base-url <url>      Override API base URL.
  *
- * Type changes: the API cannot change a monitor's type in place (PATCH
- * ignores it). A changed `type` is a replacement: delete the old monitor,
- * create the new one. That is a delete, so it only runs with --allow-delete;
- * without it the change is reported as blocked and `--yes` exits 1.
+ * A declaration takes the /api/v1/monitors fields under the API's names
+ * (src/lib/monitor-fields.ts). escalationPolicyId and selectedWebhookIds
+ * accept a public id or a name; names are resolved through
+ * GET /api/v1/escalation-policies and /api/v1/webhooks.
+ *
+ * Type changes: PATCH changes a type in place, except to or from heartbeat.
+ * Those are a replacement (delete, then create); that is a delete, so it only
+ * runs with --allow-delete; without it the change is reported as blocked and
+ * `--yes` exits 1.
  *
  * Exit codes: 0 ok · 1 error or blocked change under --yes · 2 drift with
  * --diff-only.
@@ -29,21 +34,32 @@
 import { existsSync, readFileSync } from "node:fs";
 import pc from "picocolors";
 import { Command } from "commander";
-import { createClient, ApiError } from "../lib/client.js";
+import { createClient, ApiError, type Client } from "../lib/client.js";
+import {
+  CREATE_FIELDS,
+  DECLARATION_FIELDS,
+  MONITOR_TYPES,
+  PATCH_ONLY_FIELDS,
+  SUMMARY_FIELDS,
+  fieldEqual,
+} from "../lib/monitor-fields.js";
+import { resolveReferences } from "../lib/references.js";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * One monitor in the config. Besides externalId and name, any
+ * /api/v1/monitors field (camelCase, as the API names it). A field left out
+ * is not managed: it is neither sent nor compared.
+ */
 export interface MonitorDeclaration {
   externalId: string;
   name: string;
   type?: string;
   url?: string;
-  interval?: number;
-  timeout?: number;
-  region?: string;
-  isActive?: boolean;
+  [field: string]: unknown;
 }
 
 export interface LiveMonitor {
@@ -52,10 +68,7 @@ export interface LiveMonitor {
   name: string;
   type?: string;
   url?: string;
-  interval?: number;
-  timeout?: number;
-  region?: string;
-  isActive?: boolean;
+  [field: string]: unknown;
 }
 
 export interface DesiredConfig {
@@ -74,8 +87,9 @@ export interface ApplyDiff {
   toCreate: MonitorDeclaration[];
   toUpdate: Array<{ desired: MonitorDeclaration; live: LiveMonitor; changedFields: string[] }>;
   /**
-   * Monitors whose `type` changed. The API cannot change a type in place, so
-   * these are deleted and created again; that needs --allow-delete.
+   * Monitors whose type changes to or from heartbeat. The API cannot do that
+   * in place, so these are deleted and created again; that needs
+   * --allow-delete.
    */
   toReplace: ReplaceEntry[];
   toDelete: LiveMonitor[];
@@ -100,7 +114,7 @@ export interface ApplyResult {
   updated: number;
   replaced: number;
   deleted: number;
-  /** Type changes not applied because --allow-delete was not set. */
+  /** Replacements not applied because --allow-delete was not set. */
   blocked: number;
 }
 
@@ -117,11 +131,33 @@ export function loadConfig(file: string): DesiredConfig {
   if (!Array.isArray(parsed.monitors)) {
     throw new Error(`Config must contain { "monitors": [...] }`);
   }
+  const seen = new Set<string>();
   for (const m of parsed.monitors) {
     if (!m.externalId || !m.name) {
       throw new Error(
         `Every monitor must have externalId + name. Offending entry: ${JSON.stringify(m)}`,
       );
+    }
+    if (seen.has(m.externalId)) {
+      throw new Error(`externalId "${m.externalId}" is declared twice`);
+    }
+    seen.add(m.externalId);
+    for (const key of Object.keys(m)) {
+      if (key === "managedBySource") {
+        throw new Error(`${m.externalId}: managedBySource is set by the CLI ("cli"); remove it`);
+      }
+      if (!DECLARATION_FIELDS.has(key)) {
+        throw new Error(
+          `${m.externalId}: unknown field "${key}". Fields use the API's names, e.g. expectedStatusCodes, ` +
+            `escalationPolicyId (see the README for the list).`,
+        );
+      }
+    }
+    if (m.type !== undefined && !(MONITOR_TYPES as readonly string[]).includes(m.type)) {
+      throw new Error(`${m.externalId}: type must be one of ${MONITOR_TYPES.join(", ")} (got "${m.type}")`);
+    }
+    if (m.type === "heartbeat" && m.url !== undefined) {
+      throw new Error(`${m.externalId}: heartbeat monitors get their url from UptimeWarden; remove url`);
     }
   }
   return parsed;
@@ -131,19 +167,19 @@ export function loadConfig(file: string): DesiredConfig {
 // Diff
 // ---------------------------------------------------------------------------
 
-/** Fields we compare for drift detection. */
-const TRACKED_FIELDS: Array<keyof MonitorDeclaration> = [
-  "name", "type", "url", "interval", "timeout", "region", "isActive",
-];
-
 function changedFields(desired: MonitorDeclaration, live: LiveMonitor): string[] {
-  return TRACKED_FIELDS.filter((k) => {
-    const d = desired[k];
-    const l = (live as unknown as Record<string, unknown>)[k];
-    // undefined in desired = "not managed" — don't flag as changed
-    if (d === undefined) return false;
-    return d !== l;
-  });
+  const changed: string[] = [];
+  for (const [k, d] of Object.entries(desired)) {
+    // externalId is the match key; undefined = not managed.
+    if (k === "externalId" || d === undefined) continue;
+    if (!fieldEqual(k, d, live[k])) changed.push(k);
+  }
+  return changed;
+}
+
+/** The API can change a type in place, except to or from heartbeat. */
+function needsReplace(desired: MonitorDeclaration, live: LiveMonitor, changed: string[]): boolean {
+  return changed.includes("type") && (desired.type === "heartbeat" || live.type === "heartbeat");
 }
 
 export function computeDiff(
@@ -159,10 +195,14 @@ export function computeDiff(
   for (const m of desired.monitors) {
     const found = liveByExt.get(m.externalId);
     if (!found) {
+      const type = m.type ?? "http";
+      if (type !== "heartbeat" && !m.url) {
+        throw new Error(`${m.externalId}: url is required to create a ${type} monitor`);
+      }
       toCreate.push(m);
     } else {
       const changed = changedFields(m, found);
-      if (changed.includes("type")) {
+      if (needsReplace(m, found, changed)) {
         toReplace.push({ desired: m, live: found, changedFields: changed });
       } else if (changed.length > 0) {
         toUpdate.push({ desired: m, live: found, changedFields: changed });
@@ -193,38 +233,33 @@ function unwrapData(payload: unknown): Record<string, unknown> | null {
   return payload as Record<string, unknown>;
 }
 
-async function createMonitor(
-  client: ReturnType<typeof createClient>,
-  m: MonitorDeclaration,
-): Promise<void> {
-  const created = unwrapData(
-    await client.post("/api/v1/monitors", {
-      name: m.name,
-      type: m.type ?? "http",
-      url: m.url ?? "",
-      interval: m.interval,
-      timeout: m.timeout,
-      region: m.region,
-      isActive: m.isActive,
-      externalId: m.externalId,
-      managedBySource: "cli",
-    }),
-  );
-  // The API's create path applies its default timeout whatever the body
-  // says; PATCH applies the value. Set a declared timeout right away so the
-  // next plan is clean.
+const CREATE_FIELD_SET: ReadonlySet<string> = new Set(CREATE_FIELDS);
+
+async function createMonitor(client: Client, m: MonitorDeclaration): Promise<void> {
+  const body: Record<string, unknown> = { type: "http" };
+  const afterCreate: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(m)) {
+    if (v === undefined) continue;
+    if (CREATE_FIELD_SET.has(k)) body[k] = v;
+    else if ((PATCH_ONLY_FIELDS as readonly string[]).includes(k)) afterCreate[k] = v;
+  }
+  body.managedBySource = "cli";
+  const created = unwrapData(await client.post("/api/v1/monitors", body));
   const publicId = typeof created?.publicId === "string" ? created.publicId : undefined;
-  if (m.timeout !== undefined && publicId && created?.timeout !== m.timeout) {
-    await client.patch(`/api/v1/monitors/${publicId}`, { timeout: m.timeout });
+  // groups are PATCH-only. An API older than the 2026-10 contract also
+  // ignored timeout on create; setting it again is harmless.
+  if (m.timeout !== undefined && created?.timeout !== m.timeout) afterCreate.timeout = m.timeout;
+  if (publicId && Object.keys(afterCreate).length > 0) {
+    await client.patch(`/api/v1/monitors/${publicId}`, afterCreate);
   }
 }
 
 async function applyDiff(
   diff: ApplyDiff,
-  opts: Pick<ApplyOptions, "allowDelete" | "baseUrl" | "fetchImpl">,
+  client: Client,
+  opts: Pick<ApplyOptions, "allowDelete">,
   log: (line: string) => void,
 ): Promise<{ created: number; updated: number; replaced: number; deleted: number; blocked: number }> {
-  const client = createClient({ baseUrl: opts.baseUrl, fetchImpl: opts.fetchImpl });
   let created = 0;
   let updated = 0;
   let replaced = 0;
@@ -242,7 +277,7 @@ async function applyDiff(
     log(`  ${pc.yellow("~")} updating ${pc.bold(live.name)} (${live.externalId}) [${fields.join(", ")}]…`);
     const body: Record<string, unknown> = {};
     for (const f of fields) {
-      body[f] = desired[f as keyof MonitorDeclaration];
+      body[f] = desired[f];
     }
     await client.patch(`/api/v1/monitors/${live.publicId}`, body);
     updated++;
@@ -275,7 +310,7 @@ async function applyDiff(
   if (blocked > 0) {
     log(
       pc.red(
-        `\n  ${blocked} type change(s) blocked: the API cannot change a monitor's type in place.\n` +
+        `\n  ${blocked} type change(s) blocked: the API cannot change a monitor to or from heartbeat in place.\n` +
           `  Changing it deletes the monitor (and its history) and creates a new one.\n` +
           `  Re-run with --allow-delete to replace them.`,
       ),
@@ -331,7 +366,7 @@ interface ListPagination {
  * (`page`, `limit` ≤ 100, default 20); reading only the first page would
  * make apply re-create every managed monitor past it.
  */
-export async function listManagedMonitors(client: ReturnType<typeof createClient>): Promise<LiveMonitor[]> {
+export async function listManagedMonitors(client: Client): Promise<LiveMonitor[]> {
   const all: LiveMonitor[] = [];
   for (let page = 1; page <= MAX_LIST_PAGES; page++) {
     const payload = await client
@@ -360,11 +395,33 @@ export async function listManagedMonitors(client: ReturnType<typeof createClient
   throw new Error(`Listing monitors did not finish after ${MAX_LIST_PAGES} pages`);
 }
 
+/**
+ * List rows carry only the summary fields. A declaration that manages any
+ * other field (thresholds, routing, …) is compared against the full
+ * monitor from GET /api/v1/monitors/{publicId}.
+ */
+async function withDetails(client: Client, desired: DesiredConfig, live: LiveMonitor[]): Promise<LiveMonitor[]> {
+  const declared = new Map(desired.monitors.map((m) => [m.externalId, m] as const));
+  const out: LiveMonitor[] = [];
+  for (const m of live) {
+    const d = declared.get(m.externalId);
+    const needsDetail = d && Object.keys(d).some((k) => k !== "externalId" && !SUMMARY_FIELDS.has(k));
+    if (!needsDetail) {
+      out.push(m);
+      continue;
+    }
+    const detail = unwrapData(await client.get<unknown>(`/api/v1/monitors/${encodeURIComponent(m.publicId)}`));
+    out.push({ ...m, ...(detail ?? {}) } as LiveMonitor);
+  }
+  return out;
+}
+
 export async function runApply(opts: ApplyOptions): Promise<ApplyResult> {
-  const desired = loadConfig(opts.file);
+  const config = loadConfig(opts.file);
   const client = createClient({ baseUrl: opts.baseUrl, fetchImpl: opts.fetchImpl });
 
-  const live = await listManagedMonitors(client);
+  const desired = await resolveReferences(client, config);
+  const live = await withDetails(client, desired, await listManagedMonitors(client));
   const diff = computeDiff(desired, live);
 
   if (!opts.yes) {
@@ -381,7 +438,7 @@ export async function runApply(opts: ApplyOptions): Promise<ApplyResult> {
 
   const log =
     opts.log ?? ((line: string) => (opts.json ? process.stderr : process.stdout).write(line + "\n"));
-  const counts = await applyDiff(diff, opts, log);
+  const counts = await applyDiff(diff, client, opts, log);
   return { diff, applied: true, ...counts };
 }
 
@@ -409,7 +466,7 @@ export function formatPlan(diff: ApplyDiff, allowDelete: boolean): string {
     const mark = allowDelete ? pc.magenta("±") : pc.red("!");
     const why = allowDelete
       ? "delete + create"
-      : "blocked: the API cannot change a monitor's type; replacing it deletes the monitor and its history";
+      : "blocked: the API cannot change a monitor to or from heartbeat; replacing it deletes the monitor and its history";
     lines.push(
       `    ${mark} ${r.desired.externalId} — type ${r.live.type ?? "?"} → ${r.desired.type} (${why})`,
     );
@@ -470,7 +527,7 @@ export function registerApplyCommand(program: Command): void {
     .description("Diff (or apply) a MaC config against live state")
     .requiredOption("-f, --file <path>", "Path to config file (JSON)")
     .option("--yes", "Apply changes — without this flag the run is always dry-run")
-    .option("--allow-delete", "Allow deletions: monitors not in the config, and type changes (delete + create)")
+    .option("--allow-delete", "Allow deletions: monitors not in the config, and type changes to or from heartbeat (delete + create)")
     .option("--diff-only", "Exit 2 if drift is detected (useful for PR gates)")
     .option("--json", "Print the plan (or the apply result) as JSON on stdout")
     .option("--base-url <url>", "Override API base URL")

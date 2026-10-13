@@ -79,9 +79,12 @@ export function createClient(opts: ClientOptions = {}) {
     patch: <T = unknown>(p: string, body?: unknown) => request<T>("PATCH", p, body),
     put: <T = unknown>(p: string, body?: unknown) => request<T>("PUT", p, body),
     delete: <T = unknown>(p: string) => request<T>("DELETE", p),
-    /** Fire a heartbeat ping. Public endpoint — no auth header required. */
-    heartbeatPing: async (token: string, payload?: Record<string, unknown>) => {
-      const url = `${baseUrl}/api/heartbeat/${encodeURIComponent(token)}/ping`;
+    /**
+     * Heartbeat signal. Public endpoint — the token is the credential, no
+     * auth header. kind "ping" reports success, "fail" a failure.
+     */
+    heartbeatPing: async (token: string, payload?: Record<string, unknown>, kind: "ping" | "fail" = "ping") => {
+      const url = `${baseUrl}/api/heartbeat/${encodeURIComponent(token)}/${kind}`;
       const res = await fetchImpl(url, {
         method: "POST",
         headers: {

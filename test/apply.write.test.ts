@@ -144,7 +144,7 @@ describe("uw apply without --yes", () => {
   it("never writes even when drift exists", async () => {
     const cfgFile = join(tmp, "m.json");
     writeFileSync(cfgFile, JSON.stringify({
-      monitors: [{ externalId: "a", name: "A" }, { externalId: "b", name: "B" }],
+      monitors: [{ externalId: "a", name: "A", url: "https://a" }, { externalId: "b", name: "B", type: "heartbeat" }],
     }));
     const { calls, fetchImpl } = makeFetch([]);
     const result = await runApply({ file: cfgFile, yes: false, fetchImpl, baseUrl: "https://uw.example.com" });

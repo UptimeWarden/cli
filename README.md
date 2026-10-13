@@ -41,7 +41,23 @@ uw apply -f monitors.uw.json --yes
       "name": "API (production)",
       "type": "http",
       "url": "https://api.example.com/health",
-      "interval": 60
+      "interval": 60,
+      "timeout": 10,
+      "expectedStatusCodes": "200-299",
+      "customHeaders": { "X-Probe": "uptimewarden" },
+      "responseTimeThreshold": 800,
+      "sslAlerts": { "thirtyDays": false, "fifteenDays": true, "sevenDays": true, "oneDay": true },
+      "alertTypes": ["down", "recovery"],
+      "emailAddresses": "oncall@example.com",
+      "escalationPolicyId": "P1 on-call",
+      "selectedWebhookIds": ["Slack #ops"]
+    },
+    {
+      "externalId": "nightly-backup",
+      "name": "Nightly backup",
+      "type": "heartbeat",
+      "interval": 86400,
+      "heartbeatGraceSeconds": 1800
     }
   ]
 }
@@ -51,27 +67,49 @@ uw apply -f monitors.uw.json --yes
 live monitor. The CLI only manages monitors it created (`managedBySource=cli`)
 and reads all of them, page by page, before planning.
 
-| Field | Required | Notes |
-|---|---|---|
-| `externalId` | yes | Stable key, unique per file |
-| `name` | yes | |
-| `type` | no (create defaults to `http`) | `http`, `tcp`, `udp`, `ssl`, `websocket`, `grpc`, `mcp`, `ping`, `dns`, `heartbeat`. See [Type changes](#type-changes) |
-| `url` | no | Target URL or address |
-| `interval` | no | Seconds; your plan sets the minimum |
-| `timeout` | no | Seconds (API default 30) |
-| `region` | no | `ae` (Sydney), `brs` (São Paulo), `gwc` (Sweden Central), `sea` (East Asia), `wus3` (Phoenix). Choosing a region needs Professional or Enterprise |
-| `isActive` | no | Defaults to `true` |
+Every other field is a `/api/v1/monitors` field under the API's own name, with
+the API's rules (the API reference lists them). A field left out of the file
+is not managed: the CLI neither sends it nor reports drift on it. A field the
+API does not know is rejected before anything is sent.
 
-A field left out of the file is not managed: the CLI neither sends it nor
-reports drift on it.
+| Group | Fields |
+|---|---|
+| Required | `externalId`, `name`; `url` to create any type except `heartbeat` (UptimeWarden sets a heartbeat's url, so do not give one) |
+| Basics | `type` (default `http`: `http`, `tcp`, `udp`, `ssl`, `websocket`, `mcp`, `grpc`, `ping`, `dns`, `heartbeat`), `description`, `interval`, `timeout`, `isActive`, `tags`, `groups` |
+| Regions | `region` (`ae` Sydney, `brs` São Paulo, `gwc` Sweden Central, `sea` East Asia, `wus3` Phoenix; choosing one needs region selection on your plan), `verificationRegions`, `minConfirmingRegions`, `agentId` |
+| Check settings | `method`, `requestBody`, `expectedStatusCodes`, `expectedBody`, `customHeaders`, `contentValidation`, `followRedirects`, `verifySsl`, `enableSsl`, `basicAuthUsername`, `basicAuthPassword`, `bearerToken`, `hostname`, `port`, `grpcProtoFile`, `grpcMethod`, `dnsConfig` (`recordType`, `resolver`, `expectedAnswers`) |
+| Thresholds | `retryCount`, `responseTimeThreshold` (50–5000 ms, `0` = off), `sslExpiryDays`, `sslAlerts`, `domainMonitoringEnabled`, `domainExpiryThreshold`, `securityAnalysisEnabled`, `securityAnalysisMode` |
+| Alert routing | `alertTypes`, `notifications` (channel → alert type → bool), `emailAddresses`, `phoneNumbers`, `whatsappNumbers`, `voiceNumbers` (comma-separated), `voiceMode` (`sequential` or `all`), `escalationPolicyId`, `selectedWebhookIds` |
+| Heartbeat and maintenance | `heartbeatIntervalSeconds`, `heartbeatGraceSeconds`, `maintenanceWindows` |
+
+How the diff treats them:
+
+- Nested objects (`customHeaders`, `sslAlerts`, `dnsConfig`, …) are compared
+  by value; a change sends the whole object.
+- `tags`, `groups`, `alertTypes` and `selectedWebhookIds` ignore order.
+- The clearing values `""` (`escalationPolicyId`, `externalId`,
+  `description`), `0` (`responseTimeThreshold`) and `[]` match the API's
+  null, so they do not show as drift once applied.
+- Fields beyond the list view (thresholds, routing, …) are compared against
+  the monitor's full record, read once per declared monitor that uses them.
+- `groups` is set right after a create (the API sets groups on update only).
+
+### Escalation policies and webhooks by name
+
+`escalationPolicyId` and `selectedWebhookIds` take public ids (ULIDs) or names.
+A name is looked up in `GET /api/v1/escalation-policies` or
+`GET /api/v1/webhooks` and must match exactly one item; otherwise the run
+stops and lists the names that exist. `""` detaches the policy and `[]`
+detaches all webhooks.
 
 ### Type changes
 
-The API cannot change the type of an existing monitor. When `type` changes,
-the plan shows a **replace**: the old monitor is deleted (with its history)
-and a new one is created with the same `externalId`. Because that deletes a
-monitor, it only runs with `--allow-delete`. Without it the change is shown as
-blocked and `uw apply --yes` applies everything else, then exits 1.
+A `type` change is applied in place (PATCH), except to or from `heartbeat`,
+which the API cannot do. Those show as a **replace**: the old monitor is
+deleted (with its history) and a new one is created with the same
+`externalId`. Because that deletes a monitor, it only runs with
+`--allow-delete`. Without it the change is shown as blocked and
+`uw apply --yes` applies everything else, then exits 1.
 
 ## Commands
 
@@ -81,10 +119,10 @@ blocked and `uw apply --yes` applies everything else, then exits 1.
 | `uw auth status` | Show whether a token is configured (never prints the token) |
 | `uw auth logout` | Remove the saved token |
 | `uw heartbeat <token>` | Send a heartbeat ping (`POST /api/heartbeat/:token/ping`) |
-| `uw heartbeat <token> --state failure` | Not supported yet: exits 1 without sending anything (see below) |
+| `uw heartbeat <token> --state failure [--message <text>]` | Report a failure (`POST /api/heartbeat/:token/fail`); the message becomes the incident's error (the API keeps the first 500 characters) |
 | `uw apply -f <file>` | Show the plan for a config file. Nothing is written without `--yes` |
 | `uw apply -f <file> --yes` | Apply creates and updates |
-| `uw apply -f <file> --yes --allow-delete` | Also delete CLI-managed monitors that are not in the file, and replace monitors whose `type` changed |
+| `uw apply -f <file> --yes --allow-delete` | Also delete CLI-managed monitors that are not in the file, and replace monitors whose `type` changes to or from `heartbeat` |
 | `uw apply -f <file> --diff-only` | Exit 2 when there is drift (for PR checks) |
 | `uw apply -f <file> --json` | Print the plan as JSON (with `--yes`: the result, with progress on stderr) |
 | `uw --version` / `uw --help` | Work offline |
@@ -108,17 +146,24 @@ blocked and `uw apply --yes` applies everything else, then exits 1.
   "allowDelete": false,
   "create":  [{ "externalId": "api-prod", "name": "API (production)", "type": "http" }],
   "update":  [{ "externalId": "web", "publicId": "01H…", "changedFields": ["interval"] }],
-  "replace": [{ "externalId": "db", "publicId": "01H…", "fromType": "http", "toType": "tcp", "changedFields": ["type"], "blocked": true }],
+  "replace": [{ "externalId": "db", "publicId": "01H…", "fromType": "http", "toType": "heartbeat", "changedFields": ["type"], "blocked": true }],
   "delete":  [{ "externalId": "old", "publicId": "01H…", "name": "Old", "blocked": true }]
 }
 ```
 
-### Heartbeat failures
+### Heartbeats
 
-The heartbeat endpoint records every ping as a success; it cannot record a
-failure yet. So `uw heartbeat --state failure` exits 1 and sends nothing,
-rather than reporting a failed job as healthy. To report a failure today,
-skip the ping: the monitor alerts when the heartbeat is overdue.
+```bash
+# At the end of a successful run:
+uw heartbeat "$UW_HEARTBEAT_TOKEN"
+
+# When the job fails: the incident opens now (within about 30 seconds)
+# instead of after the interval and grace.
+uw heartbeat "$UW_HEARTBEAT_TOKEN" --state failure --message "pg_dump exited 1"
+```
+
+The token is the monitor's heartbeat token (dashboard, or `heartbeat_token` in
+the Terraform provider). The endpoint needs no API token.
 
 ## Environment variables
 

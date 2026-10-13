@@ -45,7 +45,7 @@ describe("computeDiff (pure)", () => {
       { monitors: [
         { externalId: "homepage", name: "Homepage v2" },
         { externalId: "checkout", name: "Checkout flow" },
-        { externalId: "newone", name: "New monitor" },
+        { externalId: "newone", name: "New monitor", url: "https://new.example.com" },
       ] },
       [
         live({ externalId: "homepage", name: "Homepage v1" }),
@@ -89,7 +89,7 @@ describe("computeDiff (pure)", () => {
 describe("uw apply --file", () => {
   it("without --yes: reads live state, prints diff, never writes", async () => {
     const cfgFile = join(tmp, "monitors.uw.json");
-    writeFileSync(cfgFile, JSON.stringify({ monitors: [{ externalId: "homepage-prod", name: "Homepage prod" }] }));
+    writeFileSync(cfgFile, JSON.stringify({ monitors: [{ externalId: "homepage-prod", name: "Homepage prod", url: "https://example.com" }] }));
     const { calls, fetchImpl } = makeFetch([]);
     const { diff, applied } = await runApply({ file: cfgFile, fetchImpl, baseUrl: "https://api.example.com" });
     expect(diff.toCreate).toHaveLength(1);
