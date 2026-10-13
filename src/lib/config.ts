@@ -13,7 +13,7 @@
  * Env vars override file values so CI / containers don't have to manage
  * a config file at all:
  *   - UW_API_TOKEN
- *   - UW_API_URL
+ *   - UW_API_URL (UW_BASE_URL is read as an alias; UW_API_URL wins)
  *   - UW_WORKSPACE
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
@@ -67,7 +67,7 @@ export function resolveConfig(path?: string): Required<Pick<CliConfig, "baseUrl"
   const file = readConfig(path);
   return {
     apiToken: process.env.UW_API_TOKEN ?? file.apiToken,
-    baseUrl: process.env.UW_API_URL ?? file.baseUrl ?? DEFAULT_BASE_URL,
+    baseUrl: process.env.UW_API_URL || process.env.UW_BASE_URL || file.baseUrl || DEFAULT_BASE_URL,
     workspace: process.env.UW_WORKSPACE ?? file.workspace,
   };
 }
