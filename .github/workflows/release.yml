@@ -1,0 +1,63 @@
+# Publishes @uptimewarden/cli to npm when a v* tag is pushed.
+#
+# Authentication is npm trusted publishing (OIDC): there is no NPM_TOKEN
+# secret. npmjs.com must list this repository and this workflow file
+# (release.yml) as a trusted publisher for the package. See RELEASING.md.
+#
+# Trusted publishing needs npm CLI 11.5.1+ and Node 22.14.0+.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false   # no caching in release builds
+
+      - name: Use npm 11 (trusted publishing needs 11.5.1 or later)
+        run: |
+          npm install -g npm@11
+          npm --version
+
+      - name: Check the tag matches package.json
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${TAG}" != "v${version}" ]; then
+            echo "::error::Tag ${TAG} does not match package.json version ${version}"
+            exit 1
+          fi
+          # A version that is already on npm (for example the manual
+          # bootstrap release, see RELEASING.md) is not published again.
+          if npm view "@uptimewarden/cli@${version}" version >/dev/null 2>&1; then
+            echo "::notice::@uptimewarden/cli@${version} is already on npm; skipping publish"
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Publish to npm (OIDC, with provenance)
+        if: steps.version.outputs.published == 'false'
+        run: npm publish --provenance --access public
