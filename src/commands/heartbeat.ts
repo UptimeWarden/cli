@@ -54,14 +54,21 @@ export function registerHeartbeatCommand(program: Command): void {
     .action(async (token: string, opts: HeartbeatOptions) => {
       try {
         const { status, url } = await runHeartbeat(token, opts);
-        process.stdout.write(pc.green("OK ") + `${status} ${url}\n`);
+        // The token in the url is the heartbeat's credential: never print it
+        // (this output ends up in CI logs).
+        process.stdout.write(pc.green("OK ") + `${status} ${redactHeartbeatUrl(url)}\n`);
       } catch (err) {
         if (err instanceof ApiError) {
-          process.stderr.write(pc.red("ERR ") + `${err.status} ${err.url}\n`);
+          process.stderr.write(pc.red("ERR ") + `${err.status} ${redactHeartbeatUrl(err.url)}\n`);
         } else {
           process.stderr.write(pc.red("ERR ") + (err as Error).message + "\n");
         }
         process.exitCode = 1;
       }
     });
+}
+
+/** The heartbeat url with its token masked, for logs. */
+export function redactHeartbeatUrl(url: string): string {
+  return url.replace(/(\/api\/heartbeat\/)[^/?#]+/, "$1***");
 }
